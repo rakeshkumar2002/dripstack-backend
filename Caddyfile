@@ -1,0 +1,13 @@
+# TLS termination for the DripStack API.
+#
+# https is not optional here: APP_BASE_URL is what every HMAC email link
+# (action/log/pixel) and the OIDC redirect_uri are built from, and those are hit
+# by email clients, mail-image proxies and identity providers.
+#
+# Caddy also sets X-Forwarded-For / X-Forwarded-Proto, which is what makes
+# FORWARDED_ALLOW_IPS + uvicorn's proxy_headers meaningful — without them the
+# rate limiter and audit log see the proxy's IP for every request.
+{$APP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api:4000
+}

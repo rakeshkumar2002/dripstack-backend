@@ -1,0 +1,65 @@
+# Production stack for the DripStack backend.
+#
+# Prereq: a .env beside this file (NOT committed) with real secrets and real
+# https URLs. The API refuses to boot if APP_BASE_URL / DASHBOARD_URL are still
+# localhost, non-https, or end in a slash.
+#
+#   docker compose -f docker-compose.prod.yml run --rm migrate
+#   docker compose -f docker-compose.prod.yml up -d
+name: dripstack-backend
+
+# api and worker share one env_file on purpose: the worker independently needs
+# DASHBOARD_URL for the run deep-links it puts in Slack/Teams messages, and
+# splitting the config is how that silently regresses to localhost.
+x-app: &app
+  image: ghcr.io/OWNER/dripstack-backend:${IMAGE_TAG:-latest}
+  env_file: [.env]
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  migrate:
+    image: ghcr.io/OWNER/dripstack-backend:${IMAGE_TAG:-latest}
+    env_file: [.env]
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    healthcheck: {disable: true}
+
+  api:
+    <<: *app
+    command: ["api"]
+    expose: ["4000"]
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    healthcheck: {disable: true}   # no HTTP surface; the image probe is API-only
+    deploy:
+      replicas: 1                  # workers are stateless; raise for throughput
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN to the API's public hostname}
+    depends_on: [api]
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+# Postgres / RabbitMQ / Temporal are NOT defined here — point DATABASE_URL,
+# RABBITMQ_URL and TEMPORAL_ADDRESS at managed services.
+#
+# Do NOT reuse the dev docker-compose.yml `temporal` service in production. It
+# runs `temporal server start-dev`: in-memory/SQLite, single binary. It loses
+# every durable timer and workflow history on restart, which here means every
+# in-flight waitForAction sequence silently dies. Use Temporal Cloud or a real
+# auto-setup cluster backed by Postgres.

@@ -1,0 +1,20 @@
+{
+  "eventType": "metasys.api_error",
+  "technician": {
+    "email": "cyborgrock2@gmail.com",
+    "name": "Alex Rivera"
+  },
+  "error": {
+    "status": 409,
+    "code": "OBJECT_OVERRIDDEN",
+    "message": "Write to presentValue rejected",
+    "object": "AV-2-RoomTemp-Setpoint",
+    "details": {
+      "site": "Building-7",
+      "device": "NAE-55",
+      "attemptedValue": 72.5,
+      "priority": 16
+    }
+  },
+  "rawLog": "2026-06-13T09:14:02.110Z INFO  MetasysClient connecting host=nae-55.bldg7.local\n2026-06-13T09:14:02.224Z INFO  MetasysClient authenticated user=svc-integration\n2026-06-13T09:14:02.530Z DEBUG ObjectCache hydrate object=AV-2-RoomTemp-Setpoint\n2026-06-13T09:14:02.661Z INFO  WriteRequest target=presentValue value=72.5 priority=16\n2026-06-13T09:14:02.770Z DEBUG BACnetStack encode apdu=WritePropertyRequest\n2026-06-13T09:14:02.812Z DEBUG BACnetStack tx segments=1 invokeId=42\n2026-06-13T09:14:03.001Z WARN  PriorityArray slot=8 currentlyHeldBy=manualOverride\n2026-06-13T09:14:03.119Z ERROR WriteRequest rejected reason=OBJECT_OVERRIDDEN\n2026-06-13T09:14:03.120Z ERROR MetasysClient write failed object=AV-2-RoomTemp-Setpoint\n2026-06-13T09:14:03.121Z ERROR   status=409 code=OBJECT_OVERRIDDEN\n2026-06-13T09:14:03.122Z ERROR   message=\"Write to presentValue rejected\"\n2026-06-13T09:14:03.123Z DEBUG   priorityArray=[null,null,null,null,null,null,null,68.0,...]\n2026-06-13T09:14:03.140Z INFO  Retry scheduled attempt=1 backoffMs=2000\n2026-06-13T09:14:05.160Z INFO  WriteRequest target=presentValue value=72.5 priority=16\n2026-06-13T09:14:05.290Z ERROR WriteRequest rejected reason=OBJECT_OVERRIDDEN\n2026-06-13T09:14:05.291Z ERROR   a higher-priority command holds this point\n2026-06-13T09:14:05.300Z INFO  Retry scheduled attempt=2 backoffMs=4000\n2026-06-13T09:14:09.330Z ERROR WriteRequest rejected reason=OBJECT_OVERRIDDEN\n2026-06-13T09:14:09.331Z ERROR giving up after 2 retries\n2026-06-13T09:14:09.340Z INFO  emitting api_error event to DripStack ingest"
+}

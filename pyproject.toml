@@ -1,0 +1,66 @@
+[project]
+name = "dripstack"
+version = "0.1.0"
+description = "DripStack — Technical Lifecycle Communication Platform (Python/FastAPI backend)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "asyncpg>=0.30",
+    "alembic>=1.13",
+    "greenlet>=3.1",
+    "python-dotenv>=1.0",
+    "pyjwt>=2.9",
+    "passlib[bcrypt]>=1.7",
+    "bcrypt>=4.0,<5",
+    "structlog>=24.4",
+    "jinja2>=3.1",
+    "pygments>=2.18",
+    "markdown>=3.7",
+    "httpx>=0.27",
+    "aio-pika>=9.4",
+    "temporalio>=1.7",
+    "anthropic>=0.39",
+    "slowapi>=0.1.9",
+]
+
+[project.optional-dependencies]
+# AWS SES email delivery (EMAIL_PROVIDER=ses). Optional so the keyless demo and
+# the Resend path don't pull in the AWS SDK.
+ses = ["aioboto3>=13.0"]
+
+[project.scripts]
+api = "dripstack.api.run:main"
+worker = "dripstack.worker.main:main"
+seed = "dripstack.seed:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dripstack"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501: inline HTML/SQL/markdown literals can't be auto-wrapped.
+# B008: FastAPI's `Depends()` in argument defaults is the intended pattern.
+ignore = ["E501", "B008"]
