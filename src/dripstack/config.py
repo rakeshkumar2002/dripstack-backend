@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     JWT_REFRESH_TTL: str = "7d"
     LINK_SIGNING_SECRET: str = "dev-link-signing-secret-change-me"
 
+    # Google sign-in, platform-level (one OAuth app for the whole deployment),
+    # as distinct from the per-org OIDC connection in the SsoConnection table.
+    # Unset = the login page hides the button. Redirect URI to register with
+    # Google is APP_BASE_URL + /api/v1/auth/google/callback.
+    GOOGLE_CLIENT_ID: str | None = None
+    GOOGLE_CLIENT_SECRET: str | None = None
+    GOOGLE_ISSUER: str = "https://accounts.google.com"
+
     EMAIL_PROVIDER: str = "log"  # log | resend | ses
     EMAIL_FROM_DEFAULT: str = "DripStack <alerts@dripstack.dev>"
     RESEND_API_KEY: str | None = None
@@ -65,9 +73,14 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     SES_CONFIGURATION_SET: str | None = None
 
-    AI_PROVIDER: str = "fallback"  # anthropic | fallback
+    AI_PROVIDER: str = "fallback"  # anthropic | openrouter | fallback
     ANTHROPIC_API_KEY: str | None = None
     AI_MODEL: str = "claude-sonnet-4-6"
+
+    # OpenRouter (AI_PROVIDER=openrouter). OpenAI-compatible chat-completions
+    # gateway; set AI_MODEL to a routed id such as "inclusionai/ling-3.0-flash:free".
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
     SLACK_BOT_TOKEN: str | None = None
     TEAMS_WEBHOOK_URL: str | None = None

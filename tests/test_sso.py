@@ -162,6 +162,135 @@ async def test_sso_login_flow_stubbed(monkeypatch):
         await c.delete("/api/v1/sso", headers=admin)
 
 
+# ── Google sign-in (platform-level) ───────────────────────────────────────────
+
+
+def test_google_state_is_not_interchangeable_with_org_state():
+    """A state minted for one flow must not be replayable into the other."""
+    with pytest.raises(HTTPException):
+        sso._verify_google_state(sso._sign_state("org-123"))
+    with pytest.raises(HTTPException):
+        sso._verify_state(sso._sign_google_state())
+
+    sso._verify_google_state(sso._sign_google_state())  # its own state is fine
+
+
+def test_google_hidden_when_unconfigured(monkeypatch):
+    from dripstack.config import Settings
+
+    monkeypatch.setattr(sso, "settings", lambda: Settings(GOOGLE_CLIENT_ID=None, GOOGLE_CLIENT_SECRET=None))
+    assert sso._google_configured() is False
+
+    monkeypatch.setattr(sso, "settings", lambda: Settings(GOOGLE_CLIENT_ID="cid", GOOGLE_CLIENT_SECRET="sec"))
+    assert sso._google_configured() is True
+
+
+def _google_settings(**over):
+    from dripstack.config import Settings
+
+    return Settings(GOOGLE_CLIENT_ID="cid", GOOGLE_CLIENT_SECRET="sec", **over)
+
+
+def _stub_google(monkeypatch, email: str, verified: bool = True):
+    async def fake_discover(issuer):
+        assert issuer == "https://accounts.google.com"
+        return {
+            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+        }
+
+    async def fake_exchange(token_endpoint, **kw):
+        return {"access_token": "at-google"}
+
+    async def fake_userinfo(endpoint, token):
+        return {"email": email, "email_verified": verified}
+
+    monkeypatch.setattr(sso, "discover", fake_discover)
+    monkeypatch.setattr(sso, "exchange_code", fake_exchange)
+    monkeypatch.setattr(sso, "fetch_userinfo", fake_userinfo)
+
+
+async def test_google_providers_and_start(monkeypatch):
+    if not await _db_up():
+        pytest.skip("DB not reachable")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "sec")
+    from dripstack.config import settings as real_settings
+
+    real_settings.cache_clear()
+    _stub_google(monkeypatch, "demo@dripstack.dev")
+    try:
+        async with httpx.AsyncClient(transport=ASGITransport(app=_app()), base_url="http://t") as c:
+            assert (await c.get("/api/v1/auth/providers")).json() == {"google": True}
+
+            start = await c.get("/api/v1/auth/google/start")
+            assert start.status_code in (302, 307)
+            loc = start.headers["location"]
+            assert "accounts.google.com/o/oauth2" in loc and "client_id=cid" in loc
+            assert "scope=openid+email+profile" in loc
+    finally:
+        real_settings.cache_clear()
+
+
+async def test_google_callback_known_user_and_stranger(monkeypatch):
+    if not await _db_up():
+        pytest.skip("DB not reachable")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "sec")
+    from dripstack.config import settings as real_settings
+
+    real_settings.cache_clear()
+    try:
+        async with httpx.AsyncClient(transport=ASGITransport(app=_app()), base_url="http://t") as c:
+            state = sso._sign_google_state()
+
+            # Seeded user → tokens in the fragment.
+            _stub_google(monkeypatch, "demo@dripstack.dev")
+            ok = await c.get(f"/api/v1/auth/google/callback?code=abc&state={state}")
+            assert ok.status_code == 302
+            assert "/sso/callback#" in ok.headers["location"] and "accessToken=" in ok.headers["location"]
+
+            # Unknown Google account → rejected, never provisioned.
+            _stub_google(monkeypatch, "stranger@gmail.com")
+            no = await c.get(f"/api/v1/auth/google/callback?code=abc&state={sso._sign_google_state()}")
+            assert no.status_code == 302 and "sso_error=no_account" in no.headers["location"]
+
+            # Unverified email → rejected even if the account exists.
+            _stub_google(monkeypatch, "demo@dripstack.dev", verified=False)
+            unv = await c.get(f"/api/v1/auth/google/callback?code=abc&state={sso._sign_google_state()}")
+            assert unv.status_code == 302 and "sso_error=email_not_verified" in unv.headers["location"]
+
+            # Forged state → 400 before any network call.
+            bad = await c.get("/api/v1/auth/google/callback?code=abc&state=not-a-jwt")
+            assert bad.status_code == 400
+    finally:
+        real_settings.cache_clear()
+
+
+async def test_sso_discover_maps_domain_to_org(monkeypatch):
+    if not await _db_up():
+        pytest.skip("DB not reachable")
+    async with httpx.AsyncClient(transport=ASGITransport(app=_app()), base_url="http://t") as c:
+        admin, org_id = await _admin_ctx(c)
+        await c.put(
+            "/api/v1/sso", headers=admin,
+            json={"issuer": "https://idp.example.com", "clientId": "cid", "clientSecret": "sec",
+                  "allowedDomain": "dripstack.dev"},
+        )
+        try:
+            hit = await c.post("/api/v1/auth/sso/discover", json={"email": "someone@dripstack.dev"})
+            assert hit.status_code == 200 and hit.json()["orgId"] == org_id
+
+            miss = await c.post("/api/v1/auth/sso/discover", json={"email": "someone@nowhere.com"})
+            assert miss.status_code == 404
+
+            malformed = await c.post("/api/v1/auth/sso/discover", json={"email": "not-an-email"})
+            assert malformed.status_code == 400
+        finally:
+            await c.delete("/api/v1/sso", headers=admin)
+
+
 async def test_sso_resolve_rejects_unprovisioned(monkeypatch):
     if not await _db_up():
         pytest.skip("DB not reachable")

@@ -18,6 +18,7 @@ Two surfaces:
 
 from __future__ import annotations
 
+import secrets
 import time
 from urllib.parse import urlencode
 
@@ -243,6 +244,165 @@ async def sso_callback(request: Request, code: str | None = None, state: str | N
         actor_id=user_id,
         actor_label=email,
         meta={"issuer": conn.issuer},
+        request=request,
+    )
+    frag = urlencode({"accessToken": issued["accessToken"], "refreshToken": issued["refreshToken"]})
+    return RedirectResponse(url=f"{dashboard}/sso/callback#{frag}", status_code=302)
+
+
+# ── SSO discovery (public) ────────────────────────────────────────────────────
+
+
+class SsoDiscoverBody(BaseModel):
+    email: str = Field(min_length=3)
+
+
+@router.post("/auth/sso/discover")
+async def sso_discover(body: SsoDiscoverBody):
+    """Map a work email to the org whose SSO connection claims its domain.
+
+    Lets the login page ask for an email instead of an organization id, which no
+    user knows. Only ever reveals whether a domain has SSO configured — never
+    whether a given account exists.
+    """
+    email = body.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="enter a full email address")
+
+    async with session_scope() as session:
+        conns = (
+            await session.execute(
+                select(SsoConnection).where(SsoConnection.enabled.is_(True), SsoConnection.allowed_domain.isnot(None))
+            )
+        ).scalars().all()
+        # Reuses the same matcher the callback enforces, so discovery and the
+        # actual policy can never drift apart.
+        match = next((c for c in conns if _email_allowed(c, email)), None)
+
+    if match is None:
+        raise HTTPException(status_code=404, detail="no SSO configured for this email domain")
+    return {"orgId": match.organization_id}
+
+
+# ── Google sign-in (platform-level) ───────────────────────────────────────────
+#
+# Distinct from the per-org OIDC connection above: one Google OAuth app for the
+# whole deployment, so there is no org to choose before signing in. That works
+# because User.email is globally unique by design (models.py:128) — a verified
+# Google address resolves to exactly one account, or to none.
+#
+# Unknown emails are rejected rather than provisioned. A platform-wide Google
+# button that creates accounts would let anyone with a Gmail address in.
+
+
+def _google_configured() -> bool:
+    s = settings()
+    return bool(s.GOOGLE_CLIENT_ID and s.GOOGLE_CLIENT_SECRET)
+
+
+def _google_redirect_uri() -> str:
+    return settings().APP_BASE_URL.rstrip("/") + "/api/v1/auth/google/callback"
+
+
+def _sign_google_state() -> str:
+    payload = {"typ": "google_state", "nonce": secrets.token_urlsafe(16), "exp": int(time.time()) + _STATE_TTL_SECONDS}
+    return jwt.encode(payload, settings().JWT_ACCESS_SECRET, algorithm="HS256")
+
+
+def _verify_google_state(state: str) -> None:
+    try:
+        d = jwt.decode(state, settings().JWT_ACCESS_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError as err:
+        raise HTTPException(status_code=400, detail="invalid or expired sign-in state") from err
+    # Without this the org-scoped SSO state above would be accepted here, and a
+    # state minted for one flow could be replayed into the other.
+    if d.get("typ") != "google_state":
+        raise HTTPException(status_code=400, detail="invalid sign-in state")
+
+
+@router.get("/auth/providers")
+async def auth_providers():
+    """Public: which buttons the login page should render."""
+    return {"google": _google_configured()}
+
+
+@router.get("/auth/google/start")
+async def google_start():
+    if not _google_configured():
+        raise HTTPException(status_code=404, detail="Google sign-in is not configured")
+
+    doc = await discover(settings().GOOGLE_ISSUER)
+    authorize_endpoint = doc.get("authorization_endpoint")
+    if not authorize_endpoint:
+        raise HTTPException(status_code=502, detail="Google discovery missing authorization_endpoint")
+
+    params = {
+        "response_type": "code",
+        "client_id": settings().GOOGLE_CLIENT_ID,
+        "redirect_uri": _google_redirect_uri(),
+        "scope": "openid email profile",
+        "state": _sign_google_state(),
+    }
+    return RedirectResponse(url=f"{authorize_endpoint}?{urlencode(params)}", status_code=302)
+
+
+@router.get("/auth/google/callback")
+async def google_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+    dashboard = settings().DASHBOARD_URL.rstrip("/")
+    # Failures redirect to the login page rather than rendering a raw API error:
+    # the browser is mid-navigation here, not making an XHR.
+    if error:
+        return RedirectResponse(url=f"{dashboard}/login?sso_error={error}", status_code=302)
+    if not _google_configured():
+        raise HTTPException(status_code=404, detail="Google sign-in is not configured")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="missing code or state")
+
+    _verify_google_state(state)
+
+    doc = await discover(settings().GOOGLE_ISSUER)
+    token_endpoint = doc.get("token_endpoint")
+    userinfo_endpoint = doc.get("userinfo_endpoint")
+    if not token_endpoint or not userinfo_endpoint:
+        raise HTTPException(status_code=502, detail="Google discovery missing token/userinfo endpoint")
+
+    tokens = await exchange_code(
+        token_endpoint,
+        code=code,
+        redirect_uri=_google_redirect_uri(),
+        client_id=settings().GOOGLE_CLIENT_ID or "",
+        client_secret=settings().GOOGLE_CLIENT_SECRET or "",
+    )
+    access_token = tokens.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="Google token response missing access_token")
+
+    info = await fetch_userinfo(userinfo_endpoint, access_token)
+    email = (info.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=502, detail="Google userinfo missing email")
+    # Google always sets this; require it truthy rather than merely "not False",
+    # so a provider that omits the claim cannot slip an unverified address past.
+    if not info.get("email_verified"):
+        return RedirectResponse(url=f"{dashboard}/login?sso_error=email_not_verified", status_code=302)
+
+    async with session_scope() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalars().first()
+        if user is None:
+            logger.info("google sign-in rejected: no account", email=email)
+            return RedirectResponse(url=f"{dashboard}/login?sso_error=no_account", status_code=302)
+        if not user.is_active:
+            return RedirectResponse(url=f"{dashboard}/login?sso_error=account_disabled", status_code=302)
+        ctx = auth_context_for(user)
+        user_id, org = user.id, user.organization_id
+
+    issued = sign_tokens(ctx)
+    await record_audit(
+        organization_id=org,
+        action="auth.google_login",
+        actor_id=user_id,
+        actor_label=email,
+        meta={"issuer": settings().GOOGLE_ISSUER},
         request=request,
     )
     frag = urlencode({"accessToken": issued["accessToken"], "refreshToken": issued["refreshToken"]})

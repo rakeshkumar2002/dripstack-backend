@@ -234,7 +234,7 @@ Copy `.env.example` → `.env`. Key variables:
 | `RABBITMQ_URL` / `TEMPORAL_ADDRESS` | Queue + workflow engine | local compose |
 | `JWT_ACCESS_SECRET` / `JWT_REFRESH_SECRET` / `LINK_SIGNING_SECRET` | **set strong (≥32 char) values in prod** — `openssl rand -hex 32` | dev defaults |
 | `EMAIL_PROVIDER` + `RESEND_API_KEY` / `AWS_REGION` | ESP selection | `log` |
-| `AI_PROVIDER` + `ANTHROPIC_API_KEY` | `anthropic` \| `fallback` | `fallback` |
+| `AI_PROVIDER` + `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` | `anthropic` \| `openrouter` \| `fallback` | `fallback` |
 | `CORS_ALLOWED_ORIGINS` | Extra browser origins (previews), comma separated | empty |
 | `FORWARDED_ALLOW_IPS` | Trusted proxy hops for `X-Forwarded-For` | `127.0.0.1` |
 | `ENABLE_DEV_EMAIL_PREVIEW` | Force-mount `/dev/emails` in production | `false` |
@@ -260,6 +260,57 @@ The image's `HEALTHCHECK` probes `/health` and is **API-only** — disable it on
 worker service (`healthcheck: {disable: true}`) or the worker reports permanently
 unhealthy. `scripts/` is excluded from the image; use `DRIPSTACK_DEMO_DIR` if you
 need `seed` to write its demo files inside a container.
+
+### The whole stack in one command
+
+`../docker-compose.deploy.yml` (in the parent directory, so it can reach both
+repos as build contexts) runs everything — Postgres, RabbitMQ, Temporal, the API,
+the worker and the dashboard — on one machine:
+
+```bash
+cd ..                                # the directory holding both repos
+cp .env.deploy.example .env          # fill in RESEND_API_KEY / OPENROUTER_API_KEY
+docker compose -f docker-compose.deploy.yml up -d --build
+docker compose -f docker-compose.deploy.yml run --rm seed
+dripstack-backend/scripts/fire-demo-event.sh
+```
+
+Dashboard on `:3000`, API on `:4000`, Temporal UI on `:8233`, RabbitMQ UI on
+`:15672`. It runs with `NODE_ENV=development` — the production secret guard
+rejects the `http://localhost` URLs a laptop has to use. **Not a production
+topology:** the Temporal dev server keeps history in SQLite inside its container,
+so `docker compose down` loses in-flight runs. See below for the real thing.
+
+### The same stack on AWS free tier
+
+`../docker-compose.aws.yml` runs it on one **`t4g.small`** (2 vCPU / 2 GB ARM
+Graviton2) — free under the [EC2 T4g trial][t4g], 750 hrs/month **through
+31 Dec 2026**, for new and existing accounts alike. A `t3.micro` will not do: the
+six containers need ~1.4 GB and 1 GB OOMs.
+
+```bash
+# once, on a fresh Amazon Linux 2023 (arm64) instance
+scp -i key.pem bootstrap-ec2.sh ec2-user@$EIP:~/
+ssh -i key.pem ec2-user@$EIP 'bash bootstrap-ec2.sh'   # docker, compose, 2 GB swap
+
+# from your machine, each deploy
+EIP=$EIP KEY=key.pem ./deploy-aws.sh
+```
+
+Two things that setup depends on:
+
+- **Images are built locally and streamed over SSH**, never built on the box —
+  the dashboard's `pnpm build` needs more than 2 GB. `deploy-aws.sh` asserts the
+  images are `arm64` before shipping, since an amd64 image will not run on
+  Graviton.
+- **Restrict ports 3000/4000 to your own IP** in the security group.
+  `ENABLE_DEV_EMAIL_PREVIEW=true` serves `/dev/emails` with no authentication.
+  The Temporal and RabbitMQ UIs are bound to loopback and reached over an SSH
+  tunnel.
+
+Costs outside the trial: ~20 GB gp3 and one public IPv4, roughly $5.50/month.
+
+[t4g]: https://aws.amazon.com/ec2/instance-types/t4/
 
 ## Production deployment
 

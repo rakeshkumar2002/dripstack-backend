@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from pydantic import ValidationError
 
 from ..config import settings
@@ -63,23 +64,76 @@ def _extract_json(text: str) -> str:
 
 
 class AiExplainerService:
-    def __init__(self, provider: str, api_key: str | None, model: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        api_key: str | None,
+        model: str,
+        base_url: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.provider = provider
         self.model = model
         self._cache: dict[str, AiExplanation | None] = {}
+        self._api_key = api_key
+        self._base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        self._transport = transport  # tests inject a MockTransport here
         self._client = None
         if provider == "anthropic" and api_key:
             import anthropic  # imported lazily so fallback mode needs no SDK
 
             self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # One gate for both providers: no key (or provider=fallback) means the
+        # caller renders the graceful non-AI fallback instead.
+        self._enabled = self._client is not None or (provider == "openrouter" and bool(api_key))
 
     @classmethod
     def from_settings(cls) -> AiExplainerService:
         s = settings()
-        return cls(provider=s.AI_PROVIDER, api_key=s.ANTHROPIC_API_KEY, model=s.AI_MODEL)
+        key = s.OPENROUTER_API_KEY if s.AI_PROVIDER == "openrouter" else s.ANTHROPIC_API_KEY
+        return cls(provider=s.AI_PROVIDER, api_key=key, model=s.AI_MODEL, base_url=s.OPENROUTER_BASE_URL)
+
+    async def _complete(self, prompt: dict[str, str]) -> str:
+        """Provider-specific call. Returns the raw assistant text."""
+        if self._client is not None:
+            res = await self._client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                temperature=0.2,
+                system=prompt["system"],
+                messages=[{"role": "user", "content": prompt["user"]}],
+            )
+            return next((c.text for c in res.content if getattr(c, "type", None) == "text"), "")
+
+        # OpenRouter speaks the OpenAI chat-completions schema — there is no
+        # Anthropic-native /v1/messages to point the SDK at. httpx is already a
+        # dependency, so this needs no addition to the (frozen) uv.lock.
+        #
+        # Free-tier models are slow: 60s, not the 15s the email provider uses.
+        async with httpx.AsyncClient(timeout=60, transport=self._transport) as client:
+            res = await client.post(
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "HTTP-Referer": "https://dripstack.dev",
+                    "X-Title": "DripStack",
+                },
+                json={
+                    "model": self.model,
+                    "max_tokens": 1024,
+                    "temperature": 0.2,
+                    "messages": [
+                        {"role": "system", "content": prompt["system"]},
+                        {"role": "user", "content": prompt["user"]},
+                    ],
+                },
+            )
+        if res.status_code >= 300:
+            raise RuntimeError(f"openrouter: {res.status_code} {res.text}")
+        return res.json()["choices"][0]["message"]["content"] or ""
 
     async def explain(self, inp: ExplainInput) -> AiExplanation | None:
-        if self._client is None:
+        if not self._enabled:
             return None  # fallback mode — keyless demo path
 
         key = _cache_key(inp)
@@ -88,14 +142,7 @@ class AiExplainerService:
 
         prompt = build_explainer_prompt(inp)
         try:
-            res = await self._client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                temperature=0.2,
-                system=prompt["system"],
-                messages=[{"role": "user", "content": prompt["user"]}],
-            )
-            text = next((c.text for c in res.content if getattr(c, "type", None) == "text"), "")
+            text = await self._complete(prompt)
             data = json.loads(_extract_json(text))
             parsed = AiExplanation.model_validate(data)
         except (ValidationError, json.JSONDecodeError) as err:

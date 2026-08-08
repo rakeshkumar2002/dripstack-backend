@@ -39,7 +39,11 @@ DEMO_PASSWORD = "DripStackDemo!23"
 INTEGRATION_EMAIL = "integration@dripstack.dev"
 INTEGRATION_PASSWORD = "IntegrationDemo!23"
 PLATFORM_ORG_NAME = "DripStack Platform"
-TECHNICIAN_EMAIL = "cyborgrock2@gmail.com"
+# Overridable: with no verified sending domain, Resend delivers only to the
+# address that owns the account, so the demo recipient has to be settable.
+# `or` rather than a get() default: compose passes an unset var through as an
+# empty string, which would otherwise seed a technician with no address.
+TECHNICIAN_EMAIL = os.environ.get("DEMO_TECHNICIAN_EMAIL") or "cyborgrock2@gmail.com"
 # Short so the timeout→escalation branch is observable quickly in the demo.
 TIMEOUT_HOURS = float(os.environ.get("DEMO_TIMEOUT_HOURS", "0.05"))  # ~3 minutes
 
@@ -215,8 +219,11 @@ async def _seed() -> str:
         org = Organization(
             name="Johnson Controls (Demo)",
             settings={
-                "fromAddress": "Metasys Alerts <alerts@dripstack.dev>",
-                "emailProvider": "log",
+                # Per-org settings WIN over the env in get_email_provider(), so
+                # hardcoding these would make EMAIL_PROVIDER / EMAIL_FROM_DEFAULT
+                # in .env silently do nothing for the demo org.
+                "fromAddress": os.environ.get("EMAIL_FROM_DEFAULT") or "Metasys Alerts <alerts@dripstack.dev>",
+                "emailProvider": os.environ.get("EMAIL_PROVIDER") or "log",
                 "productDocContext": (
                     "OBJECT_OVERRIDDEN (HTTP 409): a BACnet point write was rejected because a "
                     "higher-priority entry in the priority array currently holds the point. A "
