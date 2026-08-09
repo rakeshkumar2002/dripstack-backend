@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from ...config import settings
-from ...db import RbacRole, Role, SsoConnection, User
+from ...db import Organization, RbacRole, Role, SsoConnection, User
 from ...db.session import session_scope
 from ...db.tenant import TenantSession
 from ...logging import logger
@@ -304,12 +304,25 @@ def _google_redirect_uri() -> str:
     return settings().APP_BASE_URL.rstrip("/") + "/api/v1/auth/google/callback"
 
 
-def _sign_google_state() -> str:
-    payload = {"typ": "google_state", "nonce": secrets.token_urlsafe(16), "exp": int(time.time()) + _STATE_TTL_SECONDS}
+def _sign_google_state(mode: str = "signin", org_name: str = "") -> str:
+    """Carry the caller's intent to the callback.
+
+    The org name for a signup goes in here rather than in a query parameter on
+    the callback URL precisely because this is signed — otherwise anyone could
+    rewrite which organization gets created mid-flow.
+    """
+    payload = {
+        "typ": "google_state",
+        "mode": mode,
+        "org": org_name,
+        "nonce": secrets.token_urlsafe(16),
+        "exp": int(time.time()) + _STATE_TTL_SECONDS,
+    }
     return jwt.encode(payload, settings().JWT_ACCESS_SECRET, algorithm="HS256")
 
 
-def _verify_google_state(state: str) -> None:
+def _verify_google_state(state: str) -> tuple[str, str]:
+    """Returns (mode, org_name)."""
     try:
         d = jwt.decode(state, settings().JWT_ACCESS_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError as err:
@@ -318,18 +331,61 @@ def _verify_google_state(state: str) -> None:
     # state minted for one flow could be replayed into the other.
     if d.get("typ") != "google_state":
         raise HTTPException(status_code=400, detail="invalid sign-in state")
+    mode = d.get("mode") or "signin"
+    return ("signup" if mode == "signup" else "signin"), str(d.get("org") or "")
+
+
+async def _provision_signup_org(session, *, org_name: str, email: str) -> User:
+    """Create a brand-new tenant and its first customer-admin from a Google signup.
+
+    settings={} rather than platform.create_customer's {"emailProvider": "log"} —
+    a self-serve org should honour whatever EMAIL_PROVIDER the deployment is
+    configured with, since a per-org setting silently wins over the env
+    (providers/email.py:126).
+    """
+    org = Organization(name=org_name.strip(), settings={})
+    session.add(org)
+    await session.flush()
+
+    role = (await session.execute(select(RbacRole).where(RbacRole.slug == "customer-admin"))).scalars().first()
+    if role is None:
+        raise HTTPException(status_code=500, detail="customer-admin role not found; run the seed")
+
+    user = User(
+        organization_id=org.id,
+        email=email,
+        # Same unusable hash resolve_sso_user() uses — a bcrypt check can never
+        # succeed, so this account cannot also become a password account.
+        password_hash="!sso-no-password",
+        role=Role.admin,
+        role_id=role.id,
+    )
+    session.add(user)
+    await session.flush()
+    await session.refresh(user)
+    logger.info("google signup provisioned org", org_id=org.id, email=email)
+    return user
 
 
 @router.get("/auth/providers")
 async def auth_providers():
-    """Public: which buttons the login page should render."""
-    return {"google": _google_configured()}
+    """Public: which buttons the login and signup pages should render."""
+    return {"google": _google_configured(), "signup": settings().SIGNUP_ENABLED}
 
 
 @router.get("/auth/google/start")
-async def google_start():
+async def google_start(mode: str = "signin", orgName: str = ""):
     if not _google_configured():
         raise HTTPException(status_code=404, detail="Google sign-in is not configured")
+
+    signup = mode == "signup"
+    # Refuse before redirecting to Google. Discovering the problem after the user
+    # has authenticated means bouncing them back with nothing to show for it.
+    if signup:
+        if not settings().SIGNUP_ENABLED:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if not orgName.strip():
+            raise HTTPException(status_code=400, detail="orgName is required to sign up")
 
     doc = await discover(settings().GOOGLE_ISSUER)
     authorize_endpoint = doc.get("authorization_endpoint")
@@ -341,7 +397,7 @@ async def google_start():
         "client_id": settings().GOOGLE_CLIENT_ID,
         "redirect_uri": _google_redirect_uri(),
         "scope": "openid email profile",
-        "state": _sign_google_state(),
+        "state": _sign_google_state("signup" if signup else "signin", orgName.strip()),
     }
     return RedirectResponse(url=f"{authorize_endpoint}?{urlencode(params)}", status_code=302)
 
@@ -358,7 +414,7 @@ async def google_callback(request: Request, code: str | None = None, state: str 
     if not code or not state:
         raise HTTPException(status_code=400, detail="missing code or state")
 
-    _verify_google_state(state)
+    mode, org_name = _verify_google_state(state)
 
     doc = await discover(settings().GOOGLE_ISSUER)
     token_endpoint = doc.get("token_endpoint")
@@ -386,11 +442,26 @@ async def google_callback(request: Request, code: str | None = None, state: str 
     if not info.get("email_verified"):
         return RedirectResponse(url=f"{dashboard}/login?sso_error=email_not_verified", status_code=302)
 
+    created = False
     async with session_scope() as session:
         user = (await session.execute(select(User).where(User.email == email))).scalars().first()
-        if user is None:
+
+        if user is None and mode == "signup":
+            # Re-check the flag at callback time, not just at start: the state is
+            # valid for 10 minutes, which is long enough for signup to be turned
+            # off in between.
+            if not settings().SIGNUP_ENABLED:
+                return RedirectResponse(url=f"{dashboard}/login?sso_error=signup_disabled", status_code=302)
+            if not org_name:
+                return RedirectResponse(url=f"{dashboard}/signup?sso_error=org_name_required", status_code=302)
+            user = await _provision_signup_org(session, org_name=org_name, email=email)
+            created = True
+        elif user is None:
             logger.info("google sign-in rejected: no account", email=email)
             return RedirectResponse(url=f"{dashboard}/login?sso_error=no_account", status_code=302)
+
+        # An existing account signing up is just a login — people do not remember
+        # which button they used last time, and a second org would be wrong.
         if not user.is_active:
             return RedirectResponse(url=f"{dashboard}/login?sso_error=account_disabled", status_code=302)
         ctx = auth_context_for(user)
@@ -399,7 +470,7 @@ async def google_callback(request: Request, code: str | None = None, state: str 
     issued = sign_tokens(ctx)
     await record_audit(
         organization_id=org,
-        action="auth.google_login",
+        action="auth.google_signup" if created else "auth.google_login",
         actor_id=user_id,
         actor_label=email,
         meta={"issuer": settings().GOOGLE_ISSUER},

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...config import settings
 from ...db import Organization, RbacRole, Role, User
 from ..audit import record_audit
 from ..auth import (
@@ -20,6 +21,7 @@ from ..auth import (
     verify_password,
     verify_refresh,
 )
+from ..ratelimit import limiter
 from ..serialize import organization as ser_org
 
 router = APIRouter(prefix="/api/v1/auth")
@@ -46,7 +48,17 @@ async def _role_id(session: AsyncSession, slug: str) -> str | None:
 
 
 @router.post("/register", status_code=201)
-async def register(body: RegisterBody, session: AsyncSession = Depends(get_session)):
+# Self-serve tenant creation is the most abusable route in the app: unauthenticated,
+# and every call writes an Organization. The `request` parameter is not unused —
+# slowapi resolves the client IP from it, and the decorator raises at import time
+# without it.
+@limiter.limit("5/hour")
+async def register(body: RegisterBody, request: Request, session: AsyncSession = Depends(get_session)):
+    # 404 rather than 403: a disabled signup should look like a route that was
+    # never deployed, not like one worth probing.
+    if not settings().SIGNUP_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
     existing = (await session.execute(select(User).where(User.email == body.email))).scalars().first()
     if existing is not None:
         raise HTTPException(status_code=409, detail="email already registered")
@@ -64,6 +76,17 @@ async def register(body: RegisterBody, session: AsyncSession = Depends(get_sessi
     session.add(user)
     await session.flush()
     await session.refresh(user)
+
+    # Signup is the one event that brings a tenant into existence; without this
+    # it would be the only auth action with no trail.
+    await record_audit(
+        organization_id=org.id,
+        action="auth.register",
+        actor_id=user.id,
+        actor_label=user.email,
+        meta={"orgName": org.name},
+        request=request,
+    )
 
     tokens = sign_tokens(auth_context_for(user))
     return {**tokens, "organization": {"id": org.id, "name": org.name}}

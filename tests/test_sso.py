@@ -222,7 +222,10 @@ async def test_google_providers_and_start(monkeypatch):
     _stub_google(monkeypatch, "demo@dripstack.dev")
     try:
         async with httpx.AsyncClient(transport=ASGITransport(app=_app()), base_url="http://t") as c:
-            assert (await c.get("/api/v1/auth/providers")).json() == {"google": True}
+            # `signup` rides along on this endpoint too; assert the field we care
+            # about rather than the whole dict, so adding another provider flag
+            # later does not break this test.
+            assert (await c.get("/api/v1/auth/providers")).json()["google"] is True
 
             start = await c.get("/api/v1/auth/google/start")
             assert start.status_code in (302, 307)

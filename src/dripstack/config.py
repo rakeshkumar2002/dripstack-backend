@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     JWT_REFRESH_TTL: str = "7d"
     LINK_SIGNING_SECRET: str = "dev-link-signing-secret-change-me"
 
+    # Self-serve onboarding: /auth/register and Google `mode=signup` both create
+    # an Organization plus a customer-admin. Set false to take signup offline
+    # without a code deploy — the routes 404 and the dashboard hides the page.
+    SIGNUP_ENABLED: bool = True
+
     # Google sign-in, platform-level (one OAuth app for the whole deployment),
     # as distinct from the per-org OIDC connection in the SsoConnection table.
     # Unset = the login page hides the button. Redirect URI to register with
