@@ -49,3 +49,41 @@ async def test_require_platform_blocks_org_users():
     with pytest.raises(HTTPException) as exc:
         await require_platform(_principal(set(), scope="organization"))
     assert exc.value.status_code == 403
+
+
+async def test_org_admin_can_patch_settings():
+    """Regression: PATCH /settings used `auth.role != "admin"`, but
+    auth_context_for() puts the RBAC *slug* in ctx.role — so every normally
+    created customer-admin got a 403 and org settings were uneditable."""
+    import httpx
+    from httpx import ASGITransport
+    from sqlalchemy import text
+
+    from dripstack.db.session import session_scope
+
+    try:
+        async with session_scope() as s:
+            await s.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        pytest.skip("DB not reachable")
+
+    from dripstack.api.main import create_app
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://t") as c:
+        tok = (
+            await c.post(
+                "/api/v1/auth/login",
+                json={"email": "demo@dripstack.dev", "password": "DripStackDemo!23"},
+            )
+        ).json()["accessToken"]
+        headers = {"authorization": f"Bearer {tok}"}
+
+        before = (await c.get("/api/v1/settings", headers=headers)).json()["organization"]
+        original = before.get("settings") or {}
+
+        r = await c.patch("/api/v1/settings", headers=headers, json={"settings": {**original, "qaProbe": True}})
+        assert r.status_code == 200, r.text
+        assert r.json()["organization"]["settings"]["qaProbe"] is True
+
+        # Put it back so the demo org is unchanged.
+        await c.patch("/api/v1/settings", headers=headers, json={"settings": original})

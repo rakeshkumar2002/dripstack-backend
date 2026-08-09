@@ -25,7 +25,7 @@ from ...db import (
 from ...db.analytics import compute_analytics
 from ...db.tenant import TenantSession
 from ...shared import sha256_hex
-from ..auth import AuthContext, require_permission, require_user, tenant_db
+from ..auth import require_permission, tenant_db
 from ..serialize import (
     api_key as ser_api_key,
 )
@@ -152,14 +152,15 @@ async def get_settings(db: TenantSession = Depends(tenant_db)):
     return {"organization": ser_org(org)}
 
 
-@router.patch("/settings")
+# RBAC, not a string compare on the legacy enum. auth_context_for() puts the
+# RBAC *slug* in ctx.role ("customer-admin"), and only falls back to the legacy
+# Role enum for users with no role_id — so `auth.role != "admin"` rejected every
+# normally-created admin, making org settings uneditable for everyone.
+@router.patch("/settings", dependencies=[Depends(require_permission("integrations.write"))])
 async def patch_settings(
     body: SettingsBody,
-    auth: AuthContext = Depends(require_user),
     db: TenantSession = Depends(tenant_db),
 ):
-    if auth.role != "admin":
-        raise HTTPException(status_code=403, detail="admin only")
     org = await db.organization()
     if org is None:
         raise HTTPException(status_code=404, detail="organization not found")
