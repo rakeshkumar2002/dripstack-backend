@@ -15,6 +15,7 @@ from httpx import ASGITransport
 from sqlalchemy import text
 
 from dripstack.api.routes.admin import _validate_events
+from dripstack.db import EventSource, OutboundWebhook, User
 from dripstack.db.session import session_scope
 
 # ── Pure unit ─────────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ async def _db_up() -> bool:
         return False
 
 
-async def test_integration_endpoints_and_member_403():
+async def test_integration_endpoints_and_member_403(cleanup):
     if not await _db_up():
         pytest.skip("DB not reachable — skipping integrations app test")
 
@@ -64,6 +65,7 @@ async def test_integration_endpoints_and_member_403():
         es = await c.post("/api/v1/event-sources", headers=admin, json={"name": f"src-{uuid.uuid4().hex[:6]}"})
         assert es.status_code == 201
         src = es.json()["eventSource"]
+        cleanup(EventSource, src['id'])
         assert src["signingSecret"].startswith("whsec_")
 
         # Outbound webhook create returns a secret; bad events → 400.
@@ -72,11 +74,14 @@ async def test_integration_endpoints_and_member_403():
         wh = await c.post("/api/v1/outbound-webhooks", headers=admin, json={"url": "https://x.dev/h", "events": ["run.resolved"]})
         assert wh.status_code == 201
         hook = wh.json()["outboundWebhook"]
+        cleanup(OutboundWebhook, hook['id'])
         assert hook["secret"].startswith("whsec_")
 
         # A customer-member is read-only on integrations.write.
         email = f"member-{uuid.uuid4().hex[:6]}@x.dev"
-        await c.post("/api/v1/users", headers=admin, json={"email": email, "password": "abcd1234", "roleSlug": "customer-member"})
+        created = await c.post("/api/v1/users", headers=admin, json={"email": email, "password": "abcd1234", "roleSlug": "customer-member"})
+        new_user_id = created.json()["user"]["id"]
+        cleanup(User, new_user_id)
         mtok = (
             await c.post("/api/v1/auth/login", json={"email": email, "password": "abcd1234"})
         ).json()["accessToken"]
@@ -85,10 +90,3 @@ async def test_integration_endpoints_and_member_403():
         assert (await c.post("/api/v1/outbound-webhooks", headers=member, json={"url": "https://x.dev/h", "events": ["run.resolved"]})).status_code == 403
         assert (await c.post("/api/v1/event-sources", headers=member, json={"name": "x"})).status_code == 403
 
-        # Cleanup.
-        await c.delete(f"/api/v1/outbound-webhooks/{hook['id']}", headers=admin)
-        await c.delete(f"/api/v1/event-sources/{src['id']}", headers=admin)
-        me = (await c.get("/api/v1/users", headers=admin)).json()["users"]
-        for u in me:
-            if u["email"] == email:
-                await c.delete(f"/api/v1/users/{u['id']}", headers=admin)

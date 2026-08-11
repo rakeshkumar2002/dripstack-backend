@@ -12,6 +12,8 @@ leak between loops.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from dripstack.api.ratelimit import limiter
@@ -42,3 +44,45 @@ def _reset_rate_limiter():
     """
     limiter.reset()
     yield
+
+
+@pytest.fixture
+async def cleanup():
+    """Remove rows a test created, even when the test fails.
+
+    Deletes straight through the ORM rather than the API, deliberately. An
+    earlier version registered `lambda: c.delete(...)` closures over the test's
+    httpx client — but `async with AsyncClient(...)` closes that client when the
+    test body exits, which is BEFORE fixture teardown, so every delete threw and
+    the suppression below hid it. Going via the database has no such lifecycle.
+
+        src = (await c.post("/api/v1/event-sources", ...)).json()["eventSource"]
+        cleanup(EventSource, src["id"])
+
+    Teardown runs in reverse order so children go before parents. Failures are
+    reported, not silently swallowed — a cleanup that quietly stops working is
+    exactly how the orphans accumulated in the first place.
+    """
+    planned: list[tuple[type, str]] = []
+
+    def register(model, pk: str):
+        planned.append((model, pk))
+        return pk
+
+    yield register
+
+    if not planned:
+        return
+    from dripstack.db.session import session_scope
+
+    failures = []
+    for model, pk in reversed(planned):
+        try:
+            async with session_scope() as s:
+                row = await s.get(model, pk)
+                if row is not None:
+                    await s.delete(row)
+        except Exception as err:  # noqa: BLE001
+            failures.append(f"{model.__name__}({pk}): {err}")
+    if failures:
+        warnings.warn("test cleanup failed, rows may be orphaned: " + "; ".join(failures), stacklevel=1)
