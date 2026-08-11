@@ -223,3 +223,29 @@ async def test_google_signup_start_refuses_blank_org_and_disabled_signup(monkeyp
         for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "SIGNUP_ENABLED"):
             monkeypatch.delenv(k, raising=False)
         _reset_settings()
+
+
+# ── analytics: the sidebar "absorbed today" card ──────────────────────────────
+
+
+async def test_analytics_exposes_today_block():
+    """The card was hardcoded to 23/28. It now reads this, so the shape matters:
+    absorbedRate must be null (not 0) when nothing has closed, because '0%'
+    reads as failure where 'no data yet' is the truth."""
+    if not await _db_up():
+        pytest.skip("DB not reachable")
+    async with httpx.AsyncClient(transport=ASGITransport(app=_app()), base_url="http://t") as c:
+        tok = (
+            await c.post("/api/v1/auth/login", json={"email": "demo@dripstack.dev", "password": "DripStackDemo!23"})
+        ).json()["accessToken"]
+        a = (await c.get("/api/v1/analytics", headers={"authorization": f"Bearer {tok}"})).json()
+
+        assert "today" in a
+        t = a["today"]
+        assert set(t) == {"total", "resolved", "terminal", "absorbedRate"}
+        assert isinstance(t["total"], int) and isinstance(t["resolved"], int)
+        assert t["resolved"] <= t["terminal"] <= t["total"]
+        if t["terminal"] == 0:
+            assert t["absorbedRate"] is None
+        else:
+            assert 0.0 <= t["absorbedRate"] <= 1.0
