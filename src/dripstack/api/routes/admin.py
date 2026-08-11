@@ -25,6 +25,7 @@ from ...db import (
 )
 from ...db.tenant import TenantSession
 from ...providers.channels import get_channel_sender
+from ...shared import UnsafeUrlError, assert_safe_outbound_url
 from ...shared.types import parse_steps, parse_trigger
 from ..audit import record_audit
 from ..auth import Principal, current_principal, hash_password, require_permission, tenant_db
@@ -397,6 +398,16 @@ def _validate_events(events: list[str]) -> None:
         )
 
 
+
+def _validate_outbound_url(url: str) -> None:
+    """SSRF guard: the worker fetches this URL server-side, so it must not be
+    aimed at the compose network or the cloud metadata endpoint."""
+    try:
+        assert_safe_outbound_url(url)
+    except UnsafeUrlError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+
+
 @router.get("/outbound-webhooks", dependencies=[Depends(require_permission("integrations.read"))])
 async def list_outbound_webhooks(db: TenantSession = Depends(tenant_db)):
     hooks = await db.all(OutboundWebhook, order_by=OutboundWebhook.created_at.desc())
@@ -406,6 +417,7 @@ async def list_outbound_webhooks(db: TenantSession = Depends(tenant_db)):
 @router.post("/outbound-webhooks", status_code=201, dependencies=[Depends(require_permission("integrations.write"))])
 async def create_outbound_webhook(body: OutboundWebhookBody, db: TenantSession = Depends(tenant_db)):
     _validate_events(body.events)
+    _validate_outbound_url(body.url)
     h = await db.add(
         OutboundWebhook(url=body.url, events=body.events, secret=f"whsec_{secrets.token_hex(24)}")
     )
@@ -418,6 +430,7 @@ async def update_outbound_webhook(hook_id: str, body: OutboundWebhookPatch, db: 
     if h is None:
         raise HTTPException(status_code=404, detail="webhook not found")
     if body.url is not None:
+        _validate_outbound_url(body.url)
         h.url = body.url
     if body.events is not None:
         _validate_events(body.events)
@@ -467,6 +480,7 @@ async def upsert_channel(channel: str, body: ChannelBody, db: TenantSession = De
     _check_channel(channel)
     if not body.webhookUrl.startswith("https://"):
         raise HTTPException(status_code=400, detail="webhook URL must be an https:// URL")
+    _validate_outbound_url(body.webhookUrl)
     ci = await _get_channel(db, channel)
     if ci is None:
         ci = await db.add(ChannelIntegration(channel=channel, webhook_url=body.webhookUrl, enabled=body.enabled))

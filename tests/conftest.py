@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from dripstack.api.ratelimit import limiter
 from dripstack.db import session as dbsession
 
 
@@ -27,3 +28,17 @@ async def _engine_per_test():
         await engine.dispose()
     dbsession._engine = None
     dbsession._sessionmaker = None
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear the in-memory rate-limit counters between tests.
+
+    The limiter keys on client IP, and every test hits the app from the same
+    one. Without this, the login throttle (10/minute) starts rejecting later
+    tests in the file purely because earlier tests logged in — a real limit
+    turning into a flaky suite. Tests that assert throttling still exercise it
+    fully, because each gets a clean slate and trips the limit on its own.
+    """
+    limiter.reset()
+    yield

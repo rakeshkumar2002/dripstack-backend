@@ -34,6 +34,7 @@ from ...db import Organization, RbacRole, Role, SsoConnection, User
 from ...db.session import session_scope
 from ...db.tenant import TenantSession
 from ...logging import logger
+from ...shared import UnsafeUrlError, assert_safe_outbound_url
 from ..audit import record_audit
 from ..auth import Principal, auth_context_for, require_permission, sign_tokens, tenant_db
 from ..serialize import sso_connection as ser_sso
@@ -54,6 +55,9 @@ async def discover(issuer: str) -> dict:
     if cached and cached[0] > time.time():
         return cached[1]
     url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    # Re-checked at fetch time, not only when the connection was saved: DNS can
+    # change under a stored issuer.
+    assert_safe_outbound_url(url)
     async with httpx.AsyncClient(timeout=10) as client:
         res = await client.get(url)
     if res.status_code >= 300:
@@ -64,6 +68,8 @@ async def discover(issuer: str) -> dict:
 
 
 async def exchange_code(token_endpoint: str, *, code: str, redirect_uri: str, client_id: str, client_secret: str) -> dict:
+    # The endpoint comes from the provider's discovery document — untrusted input.
+    assert_safe_outbound_url(token_endpoint)
     async with httpx.AsyncClient(timeout=10) as client:
         res = await client.post(
             token_endpoint,
@@ -82,6 +88,7 @@ async def exchange_code(token_endpoint: str, *, code: str, redirect_uri: str, cl
 
 
 async def fetch_userinfo(userinfo_endpoint: str, access_token: str) -> dict:
+    assert_safe_outbound_url(userinfo_endpoint)
     async with httpx.AsyncClient(timeout=10) as client:
         res = await client.get(userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"})
     if res.status_code >= 300:
@@ -510,6 +517,12 @@ async def upsert_sso(
 ):
     if not body.issuer.lower().startswith("https://"):
         raise HTTPException(status_code=400, detail="issuer must be an https:// URL")
+    # SSRF guard: discovery/token/userinfo are all fetched server-side from
+    # this host, so it must not point at the compose network or metadata.
+    try:
+        assert_safe_outbound_url(body.issuer)
+    except UnsafeUrlError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
     if body.defaultRoleSlug not in ("customer-admin", "customer-member"):
         raise HTTPException(status_code=400, detail="defaultRoleSlug must be a customer role")
 

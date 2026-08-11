@@ -12,10 +12,14 @@ from typing import Any
 import httpx
 
 from ...logging import logger
-from ...shared import hmac_sha256_hex
+from ...shared import assert_safe_outbound_url, hmac_sha256_hex
 
 
 async def process_outbound_job(job: dict[str, Any]) -> None:
+    # Last line of defence: the URL was validated when saved, but a stored row
+    # could predate the guard or its DNS could have moved since.
+    assert_safe_outbound_url(job["url"])
+
     body = json.dumps({"event": job["event"], "data": job["data"]})
     signature = hmac_sha256_hex(job["secret"], body)
 

@@ -93,6 +93,10 @@ async def register(body: RegisterBody, request: Request, session: AsyncSession =
 
 
 @router.post("/login")
+# Unthrottled, this route allowed ~1000 password guesses per minute per IP
+# against any known address. Failures are already audited; this stops them.
+# `request` is not unused — slowapi reads the client IP from it.
+@limiter.limit("10/minute")
 async def login(body: LoginBody, request: Request, session: AsyncSession = Depends(get_session)):
     user = (await session.execute(select(User).where(User.email == body.email))).scalars().first()
     if user is None or not verify_password(body.password, user.password_hash):
@@ -118,12 +122,21 @@ async def login(body: LoginBody, request: Request, session: AsyncSession = Depen
 
 
 @router.post("/refresh")
-async def refresh(body: RefreshBody):
+async def refresh(body: RefreshBody, session: AsyncSession = Depends(get_session)):
     try:
         ctx = verify_refresh(body.refreshToken)
     except Exception as err:  # noqa: BLE001
         raise HTTPException(status_code=401, detail="invalid refresh token") from err
-    return sign_tokens(ctx)
+
+    # Re-derive from the database rather than re-minting the old claims.
+    # Previously a suspended or deleted user could keep refreshing for the whole
+    # 7-day refresh window, and a role change never took effect until the token
+    # happened to expire.
+    user = await session.get(User, ctx.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="invalid refresh token")
+
+    return sign_tokens(auth_context_for(user))
 
 
 @router.get("/me")
